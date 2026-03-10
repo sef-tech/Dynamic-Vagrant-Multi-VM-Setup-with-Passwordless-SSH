@@ -47,7 +47,7 @@ Vagrant.configure("2") do |config|
       vm_ip = "#{VM_CONFIG[:base_ip]}.#{VM_CONFIG[:starting_ip] + i - 1}"
       
       # Set hostname
-      node.vm.hostname = "#{VM_CONFIG[:hostname_prefix]}-#{i}"
+      node.vm.hostname = NUM_VMS == 1 ? VM_CONFIG[:hostname_prefix] : "#{VM_CONFIG[:hostname_prefix]}-#{i}"
       
       # Configure network
       node.vm.network "private_network", ip: vm_ip
@@ -88,7 +88,8 @@ def generate_hosts_entries(current_vm, total_vms, vm_config)
     next if i == current_vm  # Skip the current VM
     vm_ip = "#{vm_config[:base_ip]}.#{vm_config[:starting_ip] + i - 1}"
     vm_display_name = total_vms == 1 ? vm_config[:vm_name_prefix] : "#{vm_config[:vm_name_prefix]}_#{i}"
-    hosts_entries << "echo \"#{vm_ip} vm#{i} #{vm_config[:hostname_prefix]}-#{i} #{vm_display_name}\" >> /etc/hosts"
+    vm_hostname = total_vms == 1 ? vm_config[:hostname_prefix] : "#{vm_config[:hostname_prefix]}-#{i}"
+    hosts_entries << "echo \"#{vm_ip} vm#{i} #{vm_hostname} #{vm_display_name}\" >> /etc/hosts"
   end
   hosts_entries.join("\n        ")
 end
