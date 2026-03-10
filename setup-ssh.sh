@@ -12,7 +12,7 @@ echo ""
 
 # Step 1: Detect all running VMs
 echo "Step 1: Detecting running VMs..."
-VM_LIST=$(vagrant status --machine-readable | grep ",state,running" | cut -d',' -f2 | grep "^vm[0-9]*$" | sort -V)
+VM_LIST=$(vagrant status --machine-readable | grep ",state,running" | cut -d',' -f2 | sort -V)
 
 if [ -z "$VM_LIST" ]; then
     echo "ERROR: No running VMs detected. Please run 'vagrant up' first."
@@ -32,11 +32,17 @@ declare -A VM_KEYS
 
 for vm in "${VM_ARRAY[@]}"; do
     echo "  Retrieving key from $vm..."
-    key=$(vagrant ssh $vm -c 'cat ~/.ssh/id_rsa.pub 2>/dev/null' 2>/dev/null | sed 's/\r$//')
+    key=$(vagrant ssh "$vm" -c 'cat ~/.ssh/id_rsa.pub 2>/dev/null' 2>/dev/null | sed 's/\r$//')
     
     if [ -z "$key" ]; then
-        echo "ERROR: Could not retrieve SSH key from $vm"
-        exit 1
+        echo "  ⚠ No SSH key found on $vm, generating one..."
+        vagrant ssh "$vm" -c 'ssh-keygen -t rsa -b 2048 -f ~/.ssh/id_rsa -N "" >/dev/null 2>&1' 2>/dev/null
+        key=$(vagrant ssh "$vm" -c 'cat ~/.ssh/id_rsa.pub 2>/dev/null' 2>/dev/null | sed 's/\r$//')
+        
+        if [ -z "$key" ]; then
+            echo "ERROR: Could not generate or retrieve SSH key from $vm"
+            exit 1
+        fi
     fi
     
     VM_KEYS[$vm]="$key"
@@ -57,35 +63,71 @@ for target_vm in "${VM_ARRAY[@]}"; do
         if [ "$source_vm" != "$target_vm" ]; then
             key="${VM_KEYS[$source_vm]}"
             # Add key only if it doesn't already exist
-            vagrant ssh $target_vm -c "grep -qF '$key' ~/.ssh/authorized_keys 2>/dev/null || echo '$key' >> ~/.ssh/authorized_keys" 2>/dev/null
+            vagrant ssh "$target_vm" -c "grep -qF '$key' ~/.ssh/authorized_keys 2>/dev/null || echo '$key' >> ~/.ssh/authorized_keys" 2>/dev/null
         fi
     done
     
     # Ensure correct permissions
-    vagrant ssh $target_vm -c "chmod 600 ~/.ssh/authorized_keys" 2>/dev/null
+    vagrant ssh "$target_vm" -c "chmod 600 ~/.ssh/authorized_keys" 2>/dev/null
     echo "  ✓ $target_vm authorized keys updated"
 done
 
 echo "✓ All keys distributed"
 echo ""
 
-# Step 4: Test SSH connections
-echo "Step 4: Testing SSH connections..."
+# Step 4: Configure SSH client on each VM to skip host verification for peer VMs
+echo "Step 4: Configuring SSH client on each VM..."
+
+# Build the list of all VM hostnames and IPs for the SSH config Host line
+HOST_PATTERNS=""
+for vm in "${VM_ARRAY[@]}"; do
+    vm_hostname=$(vagrant ssh "$vm" -c 'hostname' 2>/dev/null | sed 's/\r$//')
+    vm_ip=$(vagrant ssh "$vm" -c "hostname -I | awk '{print \$2}'" 2>/dev/null | sed 's/\r$//')
+    HOST_PATTERNS="$HOST_PATTERNS $vm_hostname $vm_ip"
+done
+
+# Extract the base IP subnet for a wildcard match
+FIRST_IP=$(vagrant ssh "${VM_ARRAY[0]}" -c "hostname -I | awk '{print \$2}'" 2>/dev/null | sed 's/\r$//')
+BASE_SUBNET=$(echo "$FIRST_IP" | cut -d'.' -f1-3)
+
+for vm in "${VM_ARRAY[@]}"; do
+    vagrant ssh "$vm" -c "cat > ~/.ssh/config <<EOF
+Host ${BASE_SUBNET}.*${HOST_PATTERNS}
+    StrictHostKeyChecking no
+    UserKnownHostsFile=/dev/null
+    LogLevel ERROR
+EOF
+chmod 600 ~/.ssh/config" 2>/dev/null
+    echo "  ✓ $vm SSH client configured"
+done
+
+echo "✓ All VMs configured"
+echo ""
+
+# Step 5: Test SSH connections
+echo "Step 5: Testing SSH connections..."
 echo ""
 
 test_connection() {
     local from=$1
-    local to=$2
-    local result=$(vagrant ssh $from -c "ssh -o BatchMode=yes -o ConnectTimeout=5 vagrant@$to 'echo SUCCESS' 2>/dev/null" 2>/dev/null | grep SUCCESS)
+    local to_host=$2
+    local to_label=$3
+    local result=$(vagrant ssh "$from" -c "ssh -o BatchMode=yes -o ConnectTimeout=5 vagrant@$to_host 'echo SUCCESS' 2>/dev/null" 2>/dev/null | grep SUCCESS)
     
     if [ -n "$result" ]; then
-        echo "  ✓ $from -> $to: Connected"
+        echo "  ✓ $from -> $to_label: Connected"
         return 0
     else
-        echo "  ✗ $from -> $to: Failed"
+        echo "  ✗ $from -> $to_label: Failed"
         return 1
     fi
 }
+
+# Get hostname for each VM for testing
+declare -A VM_HOSTNAMES
+for vm in "${VM_ARRAY[@]}"; do
+    VM_HOSTNAMES[$vm]=$(vagrant ssh "$vm" -c 'hostname' 2>/dev/null | sed 's/\r$//')
+done
 
 # Test all possible connections
 failed_connections=0
@@ -95,7 +137,8 @@ for from_vm in "${VM_ARRAY[@]}"; do
     for to_vm in "${VM_ARRAY[@]}"; do
         if [ "$from_vm" != "$to_vm" ]; then
             total_connections=$((total_connections + 1))
-            if ! test_connection "$from_vm" "$to_vm"; then
+            to_hostname="${VM_HOSTNAMES[$to_vm]}"
+            if ! test_connection "$from_vm" "$to_hostname" "$to_vm"; then
                 failed_connections=$((failed_connections + 1))
             fi
         fi
@@ -118,9 +161,10 @@ if [ $failed_connections -eq 0 ]; then
     echo "✅ All SSH connections are working perfectly!"
     echo ""
     echo "You can now SSH between VMs without passwords:"
-    echo "  vagrant ssh vm1"
-    echo "  Then inside vm1: ssh vm2"
-    echo "  Or: ssh vagrant@vm2"
+    for vm in "${VM_ARRAY[@]}"; do
+        echo "  vagrant ssh $vm"
+        echo "    Then inside: ssh <hostname-of-other-vm>"
+    done
 else
     echo "⚠️  Some connections failed. Please check the output above."
     echo "You may need to run this script again or check VM configurations."
